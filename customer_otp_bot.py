@@ -59,6 +59,11 @@ def _is_allowed_domain(email: str) -> bool:
     return any(email.endswith(f"@{d}") for d in ALLOWED_DOMAIN)
 
 
+# ✅ ADDED: helper to parse user ids from /addusers input
+def _parse_ids(text: str):
+    return [int(x) for x in re.findall(r"\d+", text or "")]
+
+
 class StateManager:
     def __init__(self, state_file: str):
         self.state_file = state_file
@@ -737,6 +742,36 @@ async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
 
 
+# ✅ ADDED: Admin-only command to import old users into subscribers
+async def addusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /addusers 111,222,333")
+        return
+
+    ids = _parse_ids(" ".join(context.args))
+    if not ids:
+        await update.message.reply_text("❌ No user IDs found.")
+        return
+
+    before = len(state_manager.get_subscribers())
+    for cid in ids:
+        state_manager.add_subscriber(cid)
+    after = len(state_manager.get_subscribers())
+
+    await update.message.reply_text(f"✅ Added {after - before} users to subscribers.")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
 
@@ -776,6 +811,9 @@ def main():
 
     # ✅ ADDED: /dash broadcast handler (admin only)
     application.add_handler(CommandHandler("dash", dash_command))
+
+    # ✅ ADDED: /addusers import handler (admin only)
+    application.add_handler(CommandHandler("addusers", addusers_command))
 
     application.add_error_handler(error_handler)
 
