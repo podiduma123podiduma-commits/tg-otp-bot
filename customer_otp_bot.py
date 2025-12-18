@@ -8,7 +8,6 @@ import threading
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin  # ✅ ADDED (needed for opening inboxX URLs)
 
 import httpx
 from bs4 import BeautifulSoup
@@ -184,11 +183,10 @@ state_manager = StateManager(STATE_FILE)
 
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
     """
-    ✅ FIXED FOR AUTH-CODE EMAILS:
-    - First open the inbox
-    - Then open the NEWEST email's preview page (inboxX/) by reading the message list
-    - Scan that newest email BODY for a 6-digit code
-    - Only if not found, fallback to scanning the inbox page text
+    Fetch the inbox HTML and extract a 6-digit OTP.
+
+    ✅ UPDATED: First open the newest email (first row in #email-table) and scan its BODY for a 6-digit code.
+    If not found, fall back to old behavior (scan inbox page text).
     """
     inbox_url = f"https://generator.email/{email}"
 
@@ -210,37 +208,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
         "Referer": "https://generator.email/",
     }
 
-    def _find_newest_inbox_preview_path(soup: BeautifulSoup) -> Optional[str]:
-        """
-        Generator.email uses pages like /inbox2/ /inbox5/ as the "opened email body".
-        The newest email is usually the FIRST item in the message list, and it contains
-        an onclick or attribute mentioning inboxX.
-        """
-        inbox_path_re = re.compile(r"(inbox\d+/)", re.IGNORECASE)
-
-        # Look through common clickable elements first
-        candidates = []
-
-        # 1) anything with onclick
-        for tag in soup.find_all(attrs={"onclick": True}):
-            onclick = tag.get("onclick") or ""
-            m = inbox_path_re.search(onclick)
-            if m:
-                candidates.append(m.group(1))
-
-        # 2) any link href containing inboxX/
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            m = inbox_path_re.search(href)
-            if m:
-                candidates.append(m.group(1))
-
-        # If we found multiple, the FIRST one is usually the newest/top message
-        if candidates:
-            return candidates[0]
-
-        return None
-
     max_retries = 3
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         for attempt in range(max_retries):
@@ -251,33 +218,65 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                # ✅ STEP 1: open NEWEST email body using inboxX found in message list
-                newest_path = _find_newest_inbox_preview_path(soup)
-                if newest_path:
-                    newest_url = urljoin("https://generator.email/", newest_path)
-                    try:
-                        logger.info(f"Opening newest email body: {newest_url}")
-                        msg_resp = await client.get(newest_url, headers=headers)
-                        msg_resp.raise_for_status()
+                # ✅ STEP 1: open newest email (first link inside #email-table)
+                newest_link = None
+                email_table = soup.find(id="email-table")
+                if email_table:
+                    first_a = email_table.find("a", href=True)
+                    if first_a and first_a.get("href"):
+                        newest_link = first_a["href"].strip()
 
-                        msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
-                        msg_text = msg_soup.get_text(" ", strip=True)
+                if newest_link:
+                    if newest_link.startswith("/"):
+                        newest_url = "https://generator.email" + newest_link
+                    elif newest_link.startswith("http"):
+                        newest_url = newest_link
+                    else:
+                        newest_url = "https://generator.email/" + newest_link
 
-                        matches = OTP_PATTERN.findall(msg_text)
-                        if matches:
-                            otp = matches[0]
-                            logger.info(f"Found OTP in newest email body: {otp}")
+                    logger.info(f"Opening newest email page: {newest_url}")
+                    msg_resp = await client.get(newest_url, headers={**headers, "Referer": inbox_url})
+                    msg_resp.raise_for_status()
+                    msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
+
+                    # scan message page text for 6-digit code
+                    msg_text = msg_soup.get_text(" ", strip=True)
+                    msg_matches = OTP_PATTERN.findall(msg_text)
+                    if msg_matches:
+                        otp = msg_matches[0]
+                        logger.info(f"Found OTP in newest email body: {otp}")
+                        return otp
+
+                    # sometimes body is inside an iframe -> try to fetch iframe src
+                    iframe = msg_soup.find("iframe", src=True)
+                    if iframe and iframe.get("src"):
+                        iframe_src = iframe["src"].strip()
+                        if iframe_src.startswith("/"):
+                            iframe_url = "https://generator.email" + iframe_src
+                        elif iframe_src.startswith("http"):
+                            iframe_url = iframe_src
+                        else:
+                            iframe_url = "https://generator.email/" + iframe_src
+
+                        logger.info(f"Opening iframe for email body: {iframe_url}")
+                        iframe_resp = await client.get(iframe_url, headers={**headers, "Referer": newest_url})
+                        iframe_resp.raise_for_status()
+                        iframe_text = BeautifulSoup(iframe_resp.text, "html.parser").get_text(" ", strip=True)
+                        iframe_matches = OTP_PATTERN.findall(iframe_text)
+                        if iframe_matches:
+                            otp = iframe_matches[0]
+                            logger.info(f"Found OTP in iframe email body: {otp}")
                             return otp
-                    except Exception as e:
-                        logger.warning(f"Failed to open newest email body: {e}")
 
-                # ✅ STEP 2 (fallback): scan inbox page text (old behavior)
-                inbox_text = soup.get_text(" ", strip=True)
-                matches = OTP_PATTERN.findall(inbox_text)
-                if matches:
-                    otp = matches[0]
-                    logger.info(f"Found OTP in inbox page text (fallback): {otp}")
-                    return otp
+                # ✅ STEP 2 (fallback): original behavior — scan inbox page text containers
+                email_bodies = soup.find_all(["div", "p", "span", "td"])
+                for element in email_bodies:
+                    text = element.get_text()
+                    matches = OTP_PATTERN.findall(text)
+                    if matches:
+                        otp = matches[0]
+                        logger.info(f"Found OTP (fallback): {otp}")
+                        return otp
 
                 logger.warning(f"No OTP found in inbox for {email}")
                 return None
