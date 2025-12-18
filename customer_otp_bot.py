@@ -8,6 +8,7 @@ import threading
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin  # ✅ ADDED (needed for opening iframe/link URLs)
 
 import httpx
 from bs4 import BeautifulSoup
@@ -16,9 +17,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ✅ ADDED: only for /dash broadcast error handling
 from telegram.error import Forbidden, RetryAfter, BadRequest
-
-# ✅ ADDED (ONLY for newest-email link handling)
-from urllib.parse import urljoin
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -186,11 +184,10 @@ state_manager = StateManager(STATE_FILE)
 
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
     """
-    NEW BEHAVIOR (as you asked):
+    ✅ FIXED:
     1) Open inbox page
-    2) Open the newest (top) email and search BODY for 6-digit code FIRST
-    3) If not found in newest email body, fallback to old behavior:
-       scan inbox page text and return the first 6-digit code found
+    2) FIRST try newest email BODY (iframe preview or first message link)
+    3) If not found, fallback to scanning inbox text (old behavior)
     """
     inbox_url = f"https://generator.email/{email}"
 
@@ -212,11 +209,19 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
         "Referer": "https://generator.email/",
     }
 
-    def _find_newest_message_url(soup: BeautifulSoup) -> Optional[str]:
-        """
-        Find a link that opens a message.
-        We pick the first matching link (newest email).
-        """
+    def _extract_preview_iframe_url(soup: BeautifulSoup) -> Optional[str]:
+        # Some temp-mail UIs show selected/newest mail body in an iframe.
+        for iframe in soup.find_all("iframe", src=True):
+            src = (iframe.get("src") or "").strip()
+            if not src:
+                continue
+            if src.startswith("about:") or src == "about:blank":
+                continue
+            return urljoin(inbox_url, src)
+        return None
+
+    def _extract_first_message_url(soup: BeautifulSoup) -> Optional[str]:
+        # Try to find a clickable message link (often newest is top).
         for a in soup.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             if not href:
@@ -224,14 +229,11 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
             if href.startswith("#") or href.startswith("javascript:"):
                 continue
 
-            lowered = href.lower()
-
-            # common patterns for message links on inbox pages
-            if any(k in lowered for k in ["message", "mail", "email", "letter", "msg"]):
+            h = href.lower()
+            if ("message" in h) or ("mail" in h) or ("email" in h) or ("letter" in h) or ("msg" in h):
                 full = urljoin(inbox_url, href)
                 if full.rstrip("/") != inbox_url.rstrip("/"):
                     return full
-
         return None
 
     max_retries = 3
@@ -244,30 +246,46 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                # ✅ STEP 1: open newest email and scan BODY first
-                msg_url = _find_newest_message_url(soup)
-                if msg_url:
+                # ✅ STEP 1: open newest email body via iframe preview
+                preview_url = _extract_preview_iframe_url(soup)
+                if preview_url:
                     try:
-                        logger.info(f"Opening newest email body: {msg_url}")
-                        msg_resp = await client.get(msg_url, headers=headers)
+                        logger.info(f"Opening preview iframe: {preview_url}")
+                        msg_resp = await client.get(preview_url, headers=headers)
                         msg_resp.raise_for_status()
-
                         msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
                         msg_text = msg_soup.get_text(" ", strip=True)
                         matches = OTP_PATTERN.findall(msg_text)
                         if matches:
                             otp = matches[0]
-                            logger.info(f"Found OTP in newest email body: {otp}")
+                            logger.info(f"Found OTP in newest email body (iframe): {otp}")
                             return otp
                     except Exception as e:
-                        logger.warning(f"Could not open newest email body: {e}")
+                        logger.warning(f"Preview iframe open failed: {e}")
 
-                # ✅ STEP 2: fallback to old behavior (scan inbox text)
+                # ✅ STEP 2: open first message link and check body
+                first_msg_url = _extract_first_message_url(soup)
+                if first_msg_url:
+                    try:
+                        logger.info(f"Opening first message link: {first_msg_url}")
+                        msg_resp = await client.get(first_msg_url, headers=headers)
+                        msg_resp.raise_for_status()
+                        msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
+                        msg_text = msg_soup.get_text(" ", strip=True)
+                        matches = OTP_PATTERN.findall(msg_text)
+                        if matches:
+                            otp = matches[0]
+                            logger.info(f"Found OTP in newest email body (link): {otp}")
+                            return otp
+                    except Exception as e:
+                        logger.warning(f"First message open failed: {e}")
+
+                # ✅ STEP 3 (fallback): scan inbox page text (old behavior)
                 inbox_text = soup.get_text(" ", strip=True)
                 matches = OTP_PATTERN.findall(inbox_text)
                 if matches:
                     otp = matches[0]
-                    logger.info(f"Found OTP in inbox page text: {otp}")
+                    logger.info(f"Found OTP in inbox page text (fallback): {otp}")
                     return otp
 
                 logger.warning(f"No OTP found in inbox for {email}")
