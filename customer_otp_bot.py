@@ -17,6 +17,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ✅ ADDED: only for /dash broadcast error handling
 from telegram.error import Forbidden, RetryAfter, BadRequest
 
+# ✅ ADDED (ONLY for newest-email link handling)
+from urllib.parse import urljoin
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -183,7 +186,11 @@ state_manager = StateManager(STATE_FILE)
 
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
     """
-    Fetch the inbox HTML and extract a 6-digit OTP.
+    NEW BEHAVIOR (as you asked):
+    1) Open inbox page
+    2) Open the newest (top) email and search BODY for 6-digit code FIRST
+    3) If not found in newest email body, fallback to old behavior:
+       scan inbox page text and return the first 6-digit code found
     """
     inbox_url = f"https://generator.email/{email}"
 
@@ -205,6 +212,28 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
         "Referer": "https://generator.email/",
     }
 
+    def _find_newest_message_url(soup: BeautifulSoup) -> Optional[str]:
+        """
+        Find a link that opens a message.
+        We pick the first matching link (newest email).
+        """
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+            if href.startswith("#") or href.startswith("javascript:"):
+                continue
+
+            lowered = href.lower()
+
+            # common patterns for message links on inbox pages
+            if any(k in lowered for k in ["message", "mail", "email", "letter", "msg"]):
+                full = urljoin(inbox_url, href)
+                if full.rstrip("/") != inbox_url.rstrip("/"):
+                    return full
+
+        return None
+
     max_retries = 3
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         for attempt in range(max_retries):
@@ -215,15 +244,31 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                # Scan common text containers for a 6-digit code
-                email_bodies = soup.find_all(["div", "p", "span", "td"])
-                for element in email_bodies:
-                    text = element.get_text()
-                    matches = OTP_PATTERN.findall(text)
-                    if matches:
-                        otp = matches[0]
-                        logger.info(f"Found OTP: {otp}")
-                        return otp
+                # ✅ STEP 1: open newest email and scan BODY first
+                msg_url = _find_newest_message_url(soup)
+                if msg_url:
+                    try:
+                        logger.info(f"Opening newest email body: {msg_url}")
+                        msg_resp = await client.get(msg_url, headers=headers)
+                        msg_resp.raise_for_status()
+
+                        msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
+                        msg_text = msg_soup.get_text(" ", strip=True)
+                        matches = OTP_PATTERN.findall(msg_text)
+                        if matches:
+                            otp = matches[0]
+                            logger.info(f"Found OTP in newest email body: {otp}")
+                            return otp
+                    except Exception as e:
+                        logger.warning(f"Could not open newest email body: {e}")
+
+                # ✅ STEP 2: fallback to old behavior (scan inbox text)
+                inbox_text = soup.get_text(" ", strip=True)
+                matches = OTP_PATTERN.findall(inbox_text)
+                if matches:
+                    otp = matches[0]
+                    logger.info(f"Found OTP in inbox page text: {otp}")
+                    return otp
 
                 logger.warning(f"No OTP found in inbox for {email}")
                 return None
