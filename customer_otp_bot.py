@@ -14,6 +14,9 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ✅ ADDED (only for broadcast error handling)
+from telegram.error import Forbidden, RetryAfter, BadRequest
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -23,14 +26,7 @@ logger = logging.getLogger(__name__)
 # ----------- ENV -----------
 TG_TOKEN = os.getenv("TG_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "6356573938").split(",")]
-
-# ✅ Use Railway service variable as a list (comma-separated)
-ALLOWED_DOMAIN = [
-    d.strip().lower()
-    for d in os.getenv("ALLOWED_DOMAIN", "").split(",")
-    if d.strip()
-]
-
+ALLOWED_DOMAIN = "code-gmail.com"  # <-- hard-coded domain
 MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
@@ -45,16 +41,6 @@ OTP_PATTERN = re.compile(r"\b(\d{6})\b")
 
 # Track consecutive network-ish errors for auto-restart
 _CONSEC_ERRORS = 0
-
-
-def _allowed_domains_text() -> str:
-    # For messages like "Only @a.com, @b.com is supported."
-    return ", ".join(f"@{d}" for d in ALLOWED_DOMAIN)
-
-
-def _is_allowed_domain(email: str) -> bool:
-    return any(email.endswith(f"@{d}") for d in ALLOWED_DOMAIN)
-
 
 class StateManager:
     def __init__(self, state_file: str):
@@ -77,6 +63,10 @@ class StateManager:
         data.setdefault("cached_otps", {})
         data.setdefault("cooldowns", {})  # user_id -> next_allowed_ts
         data.setdefault("blocked_emails", {})  # email -> {timestamp, by}
+
+        # ✅ ADDED: store user chat_ids for broadcast
+        data.setdefault("subscribers", [])  # list of chat_ids
+
         return data
 
     def _save_state(self):
@@ -147,9 +137,26 @@ class StateManager:
             return True
         return False
 
+    # ✅ ADDED: subscribers (broadcast users)
+    def add_subscriber(self, chat_id: int):
+        cid = int(chat_id)
+        if cid not in self.state["subscribers"]:
+            self.state["subscribers"].append(cid)
+            self._save_state()
+
+    def get_subscribers(self):
+        return list(self.state.get("subscribers", []))
+
+    def remove_subscriber(self, chat_id: int) -> bool:
+        cid = int(chat_id)
+        if cid in self.state.get("subscribers", []):
+            self.state["subscribers"].remove(cid)
+            self._save_state()
+            return True
+        return False
+
 
 state_manager = StateManager(STATE_FILE)
-
 
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
     """
@@ -207,7 +214,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
     return None
 
-
 # ---------------- Self-healing helpers ----------------
 def _start_timed_restart_thread():
     """Exit the process after RESTART_EVERY_MIN minutes (if enabled)."""
@@ -230,7 +236,6 @@ def _note_net_success():
     global _CONSEC_ERRORS
     _CONSEC_ERRORS = 0
 
-
 def _note_net_error_and_maybe_restart():
     """Increment error counter; if threshold reached, exit for Railway to restart."""
     global _CONSEC_ERRORS
@@ -242,7 +247,6 @@ def _note_net_error_and_maybe_restart():
         )
         os._exit(1)
 
-
 # ---------------- Commands ----------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -252,23 +256,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    domains_text = _allowed_domains_text()
+    # ✅ ADDED: register user for broadcasts
+    if update.effective_chat:
+        state_manager.add_subscriber(update.effective_chat.id)
 
     welcome_text = (
         f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
         f"🔹 Need a quick OTP? Just send:\n"
-        f"/otp yourname@yourdomain\n\n"
-        f"✅ Allowed domains: {domains_text}\n\n"
+        f"/otp yourname@{ALLOWED_DOMAIN}\n\n"
         f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
         f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
         f"🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
         f"💡 Tip: Double-check your email spelling for faster results!\n\n"
         f"📩 Example:\n"
-        f"/otp yourname@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+        f"/otp yourname@{ALLOWED_DOMAIN}"
     )
 
     await update.message.reply_text(welcome_text)
-
 
 async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -277,6 +281,10 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+
+    # ✅ ADDED: register user for broadcasts
+    if update.effective_chat:
+        state_manager.add_subscriber(update.effective_chat.id)
 
     is_admin = user.id in ADMIN_IDS
 
@@ -292,15 +300,15 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Please provide an email address.\n"
-            f"Example: /otp yourname@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            f"Example: /otp yourname@{ALLOWED_DOMAIN}"
         )
         return
 
     email = context.args[0].strip().lower()
 
-    if not _is_allowed_domain(email):
+    if not email.endswith(f"@{ALLOWED_DOMAIN}"):
         await update.message.reply_text(
-            f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported."
+            f"❌ Invalid email domain. Only @{ALLOWED_DOMAIN} is supported."
         )
         return
 
@@ -440,7 +448,6 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     # ------------------------------------------------------------------------------
 
-
 async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -465,7 +472,6 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(text)
 
-
 async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -489,7 +495,6 @@ async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID (must be a number).")
 
-
 async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -505,7 +510,7 @@ async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /clearemail <email>\n"
-            f"Example: /clearemail user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            f"Example: /clearemail user@{ALLOWED_DOMAIN}"
         )
         return
 
@@ -514,7 +519,6 @@ async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"✅ Cached OTP cleared for {email}")
     else:
         await update.message.reply_text(f"ℹ️ No cached OTP found for {email}")
-
 
 # ---------------- Admin Block/Unblock ----------------
 async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -531,14 +535,14 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /block <email>\n"
-            f"Example: /block user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            f"Example: /block user@{ALLOWED_DOMAIN}"
         )
         return
 
     email = context.args[0].strip().lower()
-    if not _is_allowed_domain(email):
+    if not email.endswith(f"@{ALLOWED_DOMAIN}"):
         await update.message.reply_text(
-            f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported."
+            f"❌ Invalid email domain. Only @{ALLOWED_DOMAIN} is supported."
         )
         return
 
@@ -551,7 +555,6 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     await update.message.reply_text("✅ Done.")
-
 
 async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -567,14 +570,14 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /unblock <email>\n"
-            f"Example: /unblock user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            f"Example: /unblock user@{ALLOWED_DOMAIN}"
         )
         return
 
     email = context.args[0].strip().lower()
-    if not _is_allowed_domain(email):
+    if not email.endswith(f"@{ALLOWED_DOMAIN}"):
         await update.message.reply_text(
-            f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported."
+            f"❌ Invalid email domain. Only @{ALLOWED_DOMAIN} is supported."
         )
         return
 
@@ -587,7 +590,6 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     await update.message.reply_text("✅ Done." if ok else "ℹ️ Not found.")
-
 
 # ---------------- Admin Log Viewer (/log) ----------------
 async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -623,20 +625,92 @@ async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error reading log: {e}")
 
+# ✅ ADDED: Admin broadcast command (/dash)
+async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    subscribers = state_manager.get_subscribers()
+    if not subscribers:
+        await update.message.reply_text("ℹ️ No users to broadcast to yet.")
+        return
+
+    bot = context.bot
+
+    # 1) If admin REPLIES to a message and sends /dash -> copy that message to everyone (supports images/media)
+    if update.message.reply_to_message:
+        src_chat_id = update.message.reply_to_message.chat_id
+        src_message_id = update.message.reply_to_message.message_id
+
+        sent = 0
+        failed = 0
+
+        for chat_id in subscribers:
+            try:
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=src_chat_id,
+                    message_id=src_message_id,
+                )
+                sent += 1
+                await asyncio.sleep(0.05)
+            except RetryAfter as e:
+                await asyncio.sleep(int(getattr(e, "retry_after", 1)))
+            except Forbidden:
+                state_manager.remove_subscriber(chat_id)
+                failed += 1
+            except BadRequest:
+                failed += 1
+            except Exception:
+                failed += 1
+
+        await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
+        return
+
+    # 2) Otherwise /dash <text> -> send text to everyone
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage:\n"
+            "1) /dash <text to broadcast>\n"
+            "2) Reply to a message (photo/text/etc) with /dash to broadcast it."
+        )
+        return
+
+    text = " ".join(context.args)
+
+    sent = 0
+    failed = 0
+
+    for chat_id in subscribers:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except RetryAfter as e:
+            await asyncio.sleep(int(getattr(e, "retry_after", 1)))
+        except Forbidden:
+            state_manager.remove_subscriber(chat_id)
+            failed += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
-
 
 def main():
     if not TG_TOKEN:
         logger.error("TG_TOKEN environment variable is not set!")
         print("❌ ERROR: TG_TOKEN environment variable is required.")
-        return
-
-    if not ALLOWED_DOMAIN:
-        logger.error("ALLOWED_DOMAIN environment variable is not set or empty!")
-        print("❌ ERROR: ALLOWED_DOMAIN environment variable is required (comma-separated if multiple).")
         return
 
     logger.info("Starting OTP bot...")
@@ -660,6 +734,10 @@ def main():
     application.add_handler(CommandHandler("block", block_command))
     application.add_handler(CommandHandler("unblock", unblock_command))
     application.add_handler(CommandHandler("log", showlog_command))
+
+    # ✅ ADDED: /dash broadcast handler
+    application.add_handler(CommandHandler("dash", dash_command))
+
     application.add_error_handler(error_handler)
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
