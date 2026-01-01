@@ -14,8 +14,9 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ✅ ADDED: only for /dash broadcast error handling
-from telegram.error import Forbidden, RetryAfter, BadRequest
+# ✅ ADDED: Telegram request config + network error types
+from telegram.request import HTTPXRequest
+from telegram.error import Forbidden, RetryAfter, BadRequest, TimedOut, NetworkError
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,7 +28,6 @@ logger = logging.getLogger(__name__)
 TG_TOKEN = os.getenv("TG_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "6356573938").split(",")]
 
-# ✅ Use Railway service variable as a list (comma-separated)
 ALLOWED_DOMAIN = [
     d.strip().lower()
     for d in os.getenv("ALLOWED_DOMAIN", "").split(",")
@@ -37,10 +37,10 @@ ALLOWED_DOMAIN = [
 MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-COOLDOWN_SECONDS = 91  # 3 minutes cooldown after success OR "no OTP"
+COOLDOWN_SECONDS = 91  # ~3 minutes cooldown after success OR "no OTP"
 
 # Self-healing knobs (optional)
-RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))          # 0 = disabled
+RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))  # 0 = disabled
 ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))  # restart if this many network errors in a row
 # ---------------------------
 
@@ -51,7 +51,6 @@ _CONSEC_ERRORS = 0
 
 
 def _allowed_domains_text() -> str:
-    # For messages like "Only @a.com, @b.com is supported."
     return ", ".join(f"@{d}" for d in ALLOWED_DOMAIN)
 
 
@@ -59,7 +58,6 @@ def _is_allowed_domain(email: str) -> bool:
     return any(email.endswith(f"@{d}") for d in ALLOWED_DOMAIN)
 
 
-# ✅ ADDED: helper to parse user ids from /addusers input
 def _parse_ids(text: str):
     return [int(x) for x in re.findall(r"\d+", text or "")]
 
@@ -80,14 +78,12 @@ class StateManager:
                 data = {}
         else:
             data = {}
-        # normalize structure
+
         data.setdefault("user_requests", {})
         data.setdefault("cached_otps", {})
-        data.setdefault("cooldowns", {})  # user_id -> next_allowed_ts
-        data.setdefault("blocked_emails", {})  # email -> {timestamp, by}
-
-        # ✅ ADDED: subscribers list for /dash broadcasts
-        data.setdefault("subscribers", [])  # list of chat_ids
+        data.setdefault("cooldowns", {})
+        data.setdefault("blocked_emails", {})
+        data.setdefault("subscribers", [])
 
         return data
 
@@ -159,7 +155,7 @@ class StateManager:
             return True
         return False
 
-    # ✅ ADDED: subscribers helpers for /dash broadcasts
+    # ---- subscribers ----
     def add_subscriber(self, chat_id: int):
         cid = int(chat_id)
         if cid not in self.state["subscribers"]:
@@ -182,12 +178,6 @@ state_manager = StateManager(STATE_FILE)
 
 
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
-    """
-    Fetch the inbox HTML and extract a 6-digit OTP.
-
-    ✅ UPDATED: First open the newest email (first row in #email-table) and scan its BODY for a 6-digit code.
-    If not found, fall back to old behavior (scan inbox page text).
-    """
     inbox_url = f"https://generator.email/{email}"
 
     headers = {
@@ -209,7 +199,9 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
     }
 
     max_retries = 3
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+
+    # ✅ Slightly more forgiving timeout for generator.email
+    async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
         for attempt in range(max_retries):
             try:
                 logger.info(f"Fetching {inbox_url} (attempt {attempt + 1}/{max_retries})")
@@ -218,7 +210,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                # ✅ STEP 1: open newest email (first link inside #email-table)
                 newest_link = None
                 email_table = soup.find(id="email-table")
                 if email_table:
@@ -239,7 +230,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                     msg_resp.raise_for_status()
                     msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
 
-                    # scan message page text for 6-digit code
                     msg_text = msg_soup.get_text(" ", strip=True)
                     msg_matches = OTP_PATTERN.findall(msg_text)
                     if msg_matches:
@@ -247,7 +237,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                         logger.info(f"Found OTP in newest email body: {otp}")
                         return otp
 
-                    # sometimes body is inside an iframe -> try to fetch iframe src
                     iframe = msg_soup.find("iframe", src=True)
                     if iframe and iframe.get("src"):
                         iframe_src = iframe["src"].strip()
@@ -268,7 +257,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                             logger.info(f"Found OTP in iframe email body: {otp}")
                             return otp
 
-                # ✅ STEP 2 (fallback): original behavior — scan inbox page text containers
                 email_bodies = soup.find_all(["div", "p", "span", "td"])
                 for element in email_bodies:
                     text = element.get_text()
@@ -293,7 +281,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
 # ---------------- Self-healing helpers ----------------
 def _start_timed_restart_thread():
-    """Exit the process after RESTART_EVERY_MIN minutes (if enabled)."""
     if RESTART_EVERY_MIN <= 0:
         return
 
@@ -315,7 +302,6 @@ def _note_net_success():
 
 
 def _note_net_error_and_maybe_restart():
-    """Increment error counter; if threshold reached, exit for Railway to restart."""
     global _CONSEC_ERRORS
     _CONSEC_ERRORS += 1
     if ERROR_RESTART_THRESHOLD > 0 and _CONSEC_ERRORS >= ERROR_RESTART_THRESHOLD:
@@ -335,7 +321,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # ✅ ADDED: register user chat_id for /dash broadcasts
     if update.effective_chat:
         state_manager.add_subscriber(update.effective_chat.id)
 
@@ -365,19 +350,15 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # ✅ ADDED: register user chat_id for /dash broadcasts
     if update.effective_chat:
         state_manager.add_subscriber(update.effective_chat.id)
 
     is_admin = user.id in ADMIN_IDS
 
-    # cooldown gate (NON-ADMIN only)
     if not is_admin:
         cd = state_manager.remaining_cooldown(user.id)
         if cd > 0:
-            await update.message.reply_text(
-                f"⏳ Please wait {cd} seconds before requesting again."
-            )
+            await update.message.reply_text(f"⏳ Please wait {cd} seconds before requesting again.")
             return
 
     if not context.args:
@@ -390,35 +371,26 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     email = context.args[0].strip().lower()
 
     if not _is_allowed_domain(email):
-        await update.message.reply_text(
-            f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported."
-        )
+        await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
         return
 
-    # blocked email behaves like "no otp right now" (do not reveal it's blocked)
     if state_manager.is_blocked(email):
         if not is_admin:
             state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
-        # --- WRITE LOG: blocked treated as no otp ---
         try:
             with open("otp_log.txt", "a") as lf:
                 lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NO_OTP\n")
-        except Exception as _:
+        except Exception:
             pass
 
-        await update.message.reply_text(
-            "❌ No OTP found right now. Please try again later."
-        )
+        await update.message.reply_text("❌ No OTP found right now. Please try again later.")
         return
 
-    # do not count yet; only count on success (NON-ADMIN only quota)
     if not is_admin:
         current_requests = state_manager.get_user_requests(user.id)
         if current_requests >= MAX_REQUESTS_PER_USER:
-            await update.message.reply_text(
-                f"⛔ You reached your limit ({MAX_REQUESTS_PER_USER})."
-            )
+            await update.message.reply_text(f"⛔ You reached your limit ({MAX_REQUESTS_PER_USER}).")
             return
         remaining_if_success = MAX_REQUESTS_PER_USER - (current_requests + 1)
     else:
@@ -430,31 +402,26 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Remaining (if success): {remaining_if_success}"
     )
 
-    # initial delay (NON-ADMIN only)
     if not is_admin:
         await asyncio.sleep(DELAY_SECONDS)
 
-    # ------- RETRY LOOP with user-visible attempt messages on NETWORK errors -------
     max_rounds = 5
     for round_idx in range(1, max_rounds + 1):
         try:
             otp = await fetch_otp_from_generator(email)
 
             if otp:
-                # Count ONLY on success (NON-ADMIN only)
                 if not is_admin:
                     state_manager.increment_user_requests(user.id)
                 state_manager.cache_otp(email, otp)
 
-                # cooldown after success (NON-ADMIN only)
                 if not is_admin:
                     state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
-                # --- WRITE LOG: success ---
                 try:
                     with open("otp_log.txt", "a") as lf:
                         lf.write(f"[{datetime.now()}] user={user.id} email={email} result=OTP:{otp}\n")
-                except Exception as _:
+                except Exception:
                     pass
 
                 _note_net_success()
@@ -474,62 +441,49 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             else:
-                # no OTP found; do NOT decrement quota
-                # cooldown after no-otp (NON-ADMIN only)
                 if not is_admin:
                     state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
-                # --- WRITE LOG: no otp ---
                 try:
                     with open("otp_log.txt", "a") as lf:
                         lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NO_OTP\n")
-                except Exception as _:
+                except Exception:
                     pass
 
                 _note_net_success()
-                await update.message.reply_text(
-                    "❌ No OTP found right now. Please try again later."
-                )
+                await update.message.reply_text("❌ No OTP found right now. Please try again later.")
                 return
 
         except httpx.HTTPError:
-            # --- WRITE LOG: network error (per attempt) ---
             try:
                 with open("otp_log.txt", "a") as lf:
                     lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NETWORK_ERROR attempt={round_idx}\n")
-            except Exception as _:
+            except Exception:
                 pass
 
-            # Network error: retry up to 5 rounds, 5s between attempts.
             if round_idx < max_rounds:
                 await update.message.reply_text(
                     f"⚠️ Network issue (attempt {round_idx}/{max_rounds}). Retrying in 5 seconds..."
                 )
                 await asyncio.sleep(5)
                 continue
-            # After 5 network-error rounds, give up politely.
+
             _note_net_error_and_maybe_restart()
-            await update.message.reply_text(
-                "⚠️ Network issue. Please wait a few minutes and try again."
-            )
+            await update.message.reply_text("⚠️ Network issue. Please wait a few minutes and try again.")
             return
 
         except Exception as e:
             logger.error(f"Unexpected error in otp_command: {e}")
 
-            # --- WRITE LOG: unexpected error ---
             try:
                 with open("otp_log.txt", "a") as lf:
                     lf.write(f"[{datetime.now()}] user={user.id} email={email} result=UNEXPECTED_ERROR:{str(e)[:120]}\n")
-            except Exception as _:
+            except Exception:
                 pass
 
             _note_net_error_and_maybe_restart()
-            await update.message.reply_text(
-                "❌ An unexpected error occurred. Please try again."
-            )
+            await update.message.reply_text("❌ An unexpected error occurred. Please try again.")
             return
-    # ------------------------------------------------------------------------------
 
 
 async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -545,15 +499,10 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cd = state_manager.remaining_cooldown(user.id)
 
     if cd > 0:
-        text = (
-            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
-            f"⏱️ Cooldown: {cd} seconds left"
-        )
+        text = f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n⏱️ Cooldown: {cd} seconds left"
     else:
-        text = (
-            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
-            f"✅ No cooldown active"
-        )
+        text = f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n✅ No cooldown active"
+
     await update.message.reply_text(text)
 
 
@@ -607,7 +556,6 @@ async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"ℹ️ No cached OTP found for {email}")
 
 
-# ---------------- Admin Block/Unblock ----------------
 async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -628,9 +576,7 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     email = context.args[0].strip().lower()
     if not _is_allowed_domain(email):
-        await update.message.reply_text(
-            f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported."
-        )
+        await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
         return
 
     state_manager.block_email(email, user.id)
@@ -638,7 +584,7 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open("otp_log.txt", "a") as lf:
             lf.write(f"[{datetime.now()}] user={user.id} email={email} action=BLOCK\n")
-    except Exception as _:
+    except Exception:
         pass
 
     await update.message.reply_text("✅ Done.")
@@ -664,9 +610,7 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     email = context.args[0].strip().lower()
     if not _is_allowed_domain(email):
-        await update.message.reply_text(
-            f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported."
-        )
+        await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
         return
 
     ok = state_manager.unblock_email(email)
@@ -674,13 +618,12 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open("otp_log.txt", "a") as lf:
             lf.write(f"[{datetime.now()}] user={user.id} email={email} action=UNBLOCK ok={ok}\n")
-    except Exception as _:
+    except Exception:
         pass
 
     await update.message.reply_text("✅ Done." if ok else "ℹ️ Not found.")
 
 
-# ---------------- Admin Log Viewer (/log) ----------------
 async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -701,9 +644,8 @@ async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         full_log = "".join(lines)
 
-        # Telegram message length safety
         if len(full_log) > 4000:
-            chunks = [full_log[i:i+4000] for i in range(0, len(full_log), 4000)]
+            chunks = [full_log[i:i + 4000] for i in range(0, len(full_log), 4000)]
             for i, chunk in enumerate(chunks, start=1):
                 await update.message.reply_text(f"📜 Log Part {i}:\n\n{chunk}")
         else:
@@ -715,7 +657,6 @@ async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error reading log: {e}")
 
 
-# ✅ ADDED: Admin broadcast command (/dash)
 async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -735,7 +676,6 @@ async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bot = context.bot
 
-    # If admin replies to a message, copy that message to all users (supports photo/video/docs/text)
     if update.message.reply_to_message:
         src_chat_id = update.message.reply_to_message.chat_id
         src_message_id = update.message.reply_to_message.message_id
@@ -765,7 +705,6 @@ async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
         return
 
-    # Otherwise /dash <text> sends plain text to all users
     if not context.args:
         await update.message.reply_text(
             "❌ Usage:\n"
@@ -795,7 +734,6 @@ async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
 
 
-# ✅ ADDED: Admin-only command to import old users into subscribers
 async def addusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -829,6 +767,38 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
 
 
+def _build_application() -> Application:
+    # ✅ FIX: Bigger Telegram API timeouts so getMe() doesn't kill you on slow networks
+    tg_request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
+    app = (
+        Application.builder()
+        .token(TG_TOKEN)
+        .request(tg_request)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("otp", otp_command))
+    app.add_handler(CommandHandler("remaining", remaining_command))
+    app.add_handler(CommandHandler("resetlimit", resetlimit_command))
+    app.add_handler(CommandHandler("clearemail", clearemail_command))
+    app.add_handler(CommandHandler("block", block_command))
+    app.add_handler(CommandHandler("unblock", unblock_command))
+    app.add_handler(CommandHandler("log", showlog_command))
+    app.add_handler(CommandHandler("dash", dash_command))
+    app.add_handler(CommandHandler("addusers", addusers_command))
+
+    app.add_error_handler(error_handler)
+    return app
+
+
 def main():
     if not TG_TOKEN:
         logger.error("TG_TOKEN environment variable is not set!")
@@ -841,36 +811,25 @@ def main():
         return
 
     logger.info("Starting OTP bot...")
-    # ... your logs ...
-
     _start_timed_restart_thread()
 
-    application = (
-        Application
-        .builder()
-        .token(TG_TOKEN)
-        .concurrent_updates(True)   # enable parallel handling
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("otp", otp_command))
-    application.add_handler(CommandHandler("remaining", remaining_command))
-    application.add_handler(CommandHandler("resetlimit", resetlimit_command))
-    application.add_handler(CommandHandler("clearemail", clearemail_command))
-    application.add_handler(CommandHandler("block", block_command))
-    application.add_handler(CommandHandler("unblock", unblock_command))
-    application.add_handler(CommandHandler("log", showlog_command))
-
-    # ✅ ADDED: /dash broadcast handler (admin only)
-    application.add_handler(CommandHandler("dash", dash_command))
-
-    # ✅ ADDED: /addusers import handler (admin only)
-    application.add_handler(CommandHandler("addusers", addusers_command))
-
-    application.add_error_handler(error_handler)
-
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ✅ FIX: never crash hard on Telegram startup timeouts; retry with backoff
+    backoff = 2
+    while True:
+        try:
+            application = _build_application()
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+            # If it exits normally, reset backoff and loop (or just break)
+            backoff = 2
+        except (TimedOut, NetworkError, httpx.HTTPError, OSError) as e:
+            logger.error(f"Telegram/network startup error: {e} — retrying in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # cap at 60s
+            continue
+        except Exception as e:
+            logger.exception(f"Fatal unexpected error: {e}")
+            _note_net_error_and_maybe_restart()
+            time.sleep(5)
 
 
 if __name__ == "__main__":
